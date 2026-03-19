@@ -1,0 +1,182 @@
+---
+title: "Descriptives & List Experiment"
+format: 
+  html:
+    embed-resources: true
+    message: false
+    warning: false
+    highlight-style: pygments
+editor_options: 
+  chunk_output_type: console
+---
+
+# Packages
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(survey)
+library(tidyr)
+```
+
+# Survey & Design
+
+```{r}
+survey <- readr::read_csv(here::here("data/survey.csv"))
+sampling <- haven::read_dta(here::here("data/design_weights_shortID.dta"))
+list_exp <- readr::read_csv(here::here("data/list_experiment.csv"))
+
+survey <- 
+  sampling |> 
+  select(
+    prc_id = shortID, stratum = highrisk, 
+    sampling_weight = w_resp_all_upscaled
+  ) |> 
+  right_join(survey, join_by(prc_id)) |> 
+  drop_na(prc_id) |> 
+  fastDummies::dummy_cols("resp_ethn", ignore_na = TRUE)
+
+```
+
+Sampling design:
+
+```{r}
+design <- svydesign(
+  ids = ~prc_id, 
+  weights = ~sampling_weight, 
+  strata = ~stratum,
+  data = survey
+)
+
+svy_descr <- function(form) {
+  
+  name <- labels(terms(form))
+  
+  stats <- tibble(
+    Name = name,
+    Mean = svymean(form, design, na.rm = TRUE),
+    SD = sqrt(svyvar(form, design, na.rm = TRUE)),
+    Min = min(survey[[name]], na.rm = TRUE),
+    Max = max(survey[[name]], na.rm = TRUE),
+    Count = unwtd.count(form, design)
+  )
+  
+  stats |> mutate(across(-Name, as.numeric))
+}
+```
+
+# Descriptives
+
+```{r}
+list(~resp_age, ~resp_male, ~resp_ethn_Bosniak, ~resp_ethn_Croat, ~resp_ethn_Serb) |> 
+  map(svy_descr) |> 
+  bind_rows() |> 
+  mutate(
+    across(where(is.numeric), \(x) round(x, 2)),
+    Name = Name |> gsub("resp_(ethn_)?", "", x = _) |> stringr::str_to_title()
+  ) |> 
+  knitr::kable()
+```
+
+# Prevalence estimates
+
+Population estimates:
+
+```{r}
+svyciprop(~wtsv_self, design = design, method = "logit")
+svyciprop(~wtsv_self_family, design = design, method = "logit")
+```
+
+Sample estimates:
+
+```{r}
+
+unadjusted <- svydesign(ids = ~1, weights = ~1, data = survey)
+
+unadj_self <- svyciprop(~wtsv_self, design = unadjusted, method = "logit")
+unadj_family <- svyciprop(~wtsv_self_family, design = unadjusted, method = "logit")
+
+unadj_self
+unadj_family
+```
+
+Will compare to list experiment later:
+
+```{r}
+
+self_reported <- 
+  list(Self = unadj_self, Family = unadj_family) |> 
+  imap(function(prop, name) {
+    tibble(
+      name = name,
+      lower = as.numeric(attr(prop, "ci")[1]),
+      upper = as.numeric(attr(prop, "ci")[2]),
+      estimate = as.numeric(prop)
+    )
+  }) |> 
+  bind_rows() |> 
+  mutate(across(-name, \(x) x * 100), type = "Self-reported")
+```
+
+
+# List experiment
+
+Obtain prevalence estimates from list experiment (for self/family victimization):
+
+```{r}
+list_exp <- 
+  list_exp |> 
+  drop_na(prc_id) |> 
+  mutate(
+    across(
+      contains("count"), 
+      \(x) x*100, 
+      .names = "{gsub('count', 'score', col)}"
+    ),
+    prc_id = factor(prc_id)
+  )
+
+models <- list(
+  Self = fixest::feols(
+    le_self_score ~ treat_control | prc_id,
+    data = list_exp,
+    cluster = ~prc_id
+  ),
+  Family = fixest::feols(
+    le_family_score ~ treat_control | prc_id,
+    data = list_exp,
+    cluster = ~prc_id
+  )
+)
+
+models |> 
+  map(broom::tidy) |> 
+  tibble::enframe() |> 
+  unnest(value) |> 
+  mutate(
+    lower = estimate - std.error, 
+    upper = estimate + std.error,
+    type = "List experiment"
+  ) |> 
+  select(name, estimate, lower, upper, type) |> 
+  bind_rows(self_reported) |> 
+  ggplot(aes(x = estimate, y = name, color = type)) +
+  geom_vline(xintercept = 0, lty = "dotted") +
+  geom_point(position = position_dodge(width = .1)) +
+  geom_errorbar(
+    aes(xmin = lower, xmax = upper), 
+    width = .05,
+    position = position_dodge(width = .1)
+  ) +
+  theme_minimal() +
+  scale_x_continuous(labels = scales::label_percent(scale = 1)) +
+  labs(
+    title = "Sample Prevalence",
+    subtitle = "Self-reported and list experiment estimates",
+    x = "Prevalence Estimate",
+    y = "",
+    color = "",
+    caption = "CIs for self-reported measure constructed on logit scale"
+  )
+```

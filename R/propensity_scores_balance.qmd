@@ -1,0 +1,655 @@
+---
+title: "Propensity Score Estimation with ML"
+format: 
+  html:
+    embed-resources: true
+    message: false
+    warning: false
+    highlight-style: pygments
+editor_options: 
+  chunk_output_type: console
+---
+
+Instead of tuning models the usual way, we tune directly on the covariate balance achieved when weighting on the inverse of the predicted class probabilities of a classifier.
+
+For each model, we end up with one configuration that yielded the lowest remaining covariate imbalance.
+
+# Packages & Data
+
+```{r}
+library(cobalt)
+library(discrim)
+library(furrr)
+library(future)
+library(progressr)
+library(purrr)
+library(tidymodels)
+
+# for plots:
+library(showtext)
+library(sysfonts)
+
+font_add(
+  "Gyre",
+  regular = "/usr/share/texmf/fonts/opentype/public/tex-gyre/texgyretermes-regular.otf"
+)
+
+showtext_auto()
+
+theme_paper <- function(base_size = 14, base_family = "Gyre") {
+  theme_minimal(base_size = base_size, base_family = base_family) +
+    theme(
+      panel.grid.major = element_line(color = "#E5E5E5", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+
+      plot.title = element_text(face = "bold", size = rel(1.2)),
+      plot.subtitle = element_text(color = "black"),
+
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+
+      panel.background = element_blank(),
+      plot.background = element_blank()
+    )
+}
+
+theme_set(theme_paper())
+
+set.seed(42)
+
+fac_to_int <- function(x) {
+  as.integer(as.character(x))
+}
+```
+
+# Prep
+
+Not using settlement features for now (measured at current location = post-treatment; need to match wartime locations which might get messy). We are using respondent characteristics:
+
+* Age
+* Sex
+* Ethnicity
+* Experienced other victimization
+
+```{r}
+survey <- 
+  readr::read_csv(here::here("data/survey.csv")) |> 
+  drop_na(crsv_self_family, resp_ethn) |>
+  fastDummies::dummy_cols(c("resp_ethn", "resp_educ")) |> 
+  select(
+    uuid, starts_with(c("resp_ethn", "resp_educ_")), resp_age, 
+    crsv_self_family, victim_other, resp_ethn,
+    resp_male
+  ) |> 
+  # outcome has to be factor for classification task with tidymodels,
+  # first level is interpreted as event level ("treated" or here "moderated")
+  mutate(crsv_self_family = factor(crsv_self_family, levels = c(1, 0)))
+```
+
+# Inspect
+
+Feature correlations:
+
+```{r}
+survey |> 
+  select(-c(uuid, crsv_self_family, resp_ethn)) |> 
+  cor() |> 
+  corrplot::corrplot(method = "color", type = "upper", tl.cex = 0.6)
+```
+
+Correlations with treatment:
+
+```{r}
+survey |> 
+  select(crsv_self_family, where(is.numeric)) |> 
+  summarise(
+    across(
+      -crsv_self_family,
+      \(x) cor(x, fac_to_int(crsv_self_family), use = "complete.obs")
+    )
+  ) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "r") |> 
+  arrange(desc(abs(r)))
+```
+
+# Models & Workflow
+
+* Random forest with tuned hyperparameters
+* Penalized logistic regression with benchmark; tune both mixture (type) and penalty (amount) of regularization.
+
+Data is imbalanced, but we won't use oversampling or SMOTE to not alter the distributions (fit model on observed data generating process). Preprocessing recipe:
+
+```{r}
+prop_rec <- 
+  recipe(crsv_self_family ~ ., data = survey) |> 
+  update_role(uuid, new_role = "ID") |> 
+  step_normalize(all_numeric_predictors()) |> 
+  # drop resp_ethn (categorical) for modelling, but keep inside
+  # data for later. Also, drop one of the dummies each bc of 
+  # collinearity (serve as baseline):
+  step_rm(resp_ethn, resp_ethn_Croat, resp_educ_None)
+
+# logistic regression also gets first-order interactions between all
+# respondent attributes as features:
+prop_rec_log <- 
+  prop_rec |> 
+  step_interact(terms = ~ starts_with("resp"):starts_with("resp"))
+```
+
+Models specifications. Since the logistic regression will include all first-order interaction terms, many of which may be irrelevant, we allow regularization (tuning type and strength):
+
+```{r}
+log_spec <- 
+  logistic_reg(
+    penalty = tune(),
+    mixture = tune() # 0 = ridge, 1 = lasso, 0 < mixture < 1 = elastic net
+  ) |> 
+  set_engine("glmnet") |> 
+  set_mode("classification")
+
+xgb_spec <-
+  boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    mtry = tune()
+  ) |>
+  set_engine(
+    "xgboost", 
+    objective = "binary:logistic", 
+    counts = FALSE
+  ) |>
+  set_mode("classification")
+
+rf_spec <-
+  rand_forest(
+    trees = tune(),
+    mtry = tune(),
+    min_n = tune()
+  ) |>
+  set_engine(
+    "ranger",
+    probability = TRUE,
+    importance = "impurity"
+  ) |>
+  set_mode("classification")
+```
+
+Hyperparameter grids for tuning. The ranges are not apriori, but are derived from prior testing.
+
+```{r}
+log_grid <-
+  grid_space_filling(
+    penalty(range = c(-3, -1)),  # log10 scale
+    mixture(range = c(0, 1)),
+    size = 50
+  )
+
+xgb_grid <-
+  grid_space_filling(
+    trees(range = c(500, 1500)),
+    tree_depth(range = c(1, 5)),
+    learn_rate(range = c(1e-3, .1), trans = NULL),
+    min_n(range = c(3, 30)),
+    loss_reduction(range = c(1e-3, .99), trans = NULL),
+    sample_size = sample_prop(range = c(.7, .9)),
+    mtry = mtry_prop(range = c(.6, 1)),
+    size = 200,
+    type = "latin_hypercube"
+  )
+
+rf_grid <-
+  grid_space_filling(
+    trees(range = c(500, 2000)),
+    mtry = mtry_prop(range = c(0.3, 1)),
+    min_n(range = c(5, 150)),
+    size = 150,
+    type = "latin_hypercube"
+  )
+```
+
+# Helper functions for tuning
+
+Functions to compute balance statistics from fitted tidymodels workflow:
+
+```{r}
+augment_ipw <- function(wflow, data, clip = 0) {
+  form <- formula(extract_recipe(wflow))
+  lhs <- rlang::f_lhs(form)
+  
+  df_fit <- 
+    wflow |> 
+    augment(data) |> 
+    rename(prop = .pred_1) |> 
+    mutate(!!lhs := fac_to_int(!!lhs))
+  
+  true_prop <- mean(pull(df_fit, lhs), na.rm = TRUE)
+  
+  df_fit |> 
+    mutate(
+      prop = pmin(pmax(prop, clip), 1 - clip),
+      ipw = if_else(
+        !!lhs == 1, 
+        true_prop / prop, 
+        (1 - true_prop) / (1 - prop)
+      )
+    )
+}
+
+balance_stats <- function(formula, data, weights) {
+  balance <- bal.tab(
+    formula, 
+    weights = weights,
+    data = data, 
+    estimand = "ATE"
+  )
+  
+  tibble(
+    mean_asmd = mean(abs(balance$Balance$Diff.Adj)),
+    max_asmd = max(abs(balance$Balance$Diff.Adj)),
+    ess_treat = balance$Observations["Adjusted", ]$Treated,
+    ess_cont = balance$Observations["Adjusted", ]$Control
+  )
+}
+```
+
+# Tuning
+
+For every model, fit every config from the grid to the data, calculate stabilized inverse probability weights & compute remaining imbalance. We are trying to find the model/config that generates the best balance.
+
+Model configs:
+
+```{r}
+models <- tribble(
+  ~id,             ~spec,     ~recipe,      ~grid,
+  "Random Forest", rf_spec,   prop_rec,     rf_grid,
+  "XGBoost",       xgb_spec,  prop_rec,     xgb_grid,
+  "Elastic Net",   log_spec,  prop_rec_log, log_grid,
+)
+
+models
+```
+
+Tuning procedure. Parallelizing over all but one available cores to speed this up.
+
+```{r}
+# Using constant formula since `prop_rec_log` includes interaction terms
+# that tidymodels builds into the df (means the formula extracted from
+# that recipe will have columns that do not exist in the original data):
+FORMULA <- formula(prep(prop_rec, survey))
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+tuning_res <- pmap(models, function(id, spec, recipe, grid) {
+  
+  n <- nrow(grid)
+  
+  message(sprintf("\nFitting %d models for %s...", n, id))
+  
+  with_progress({
+    
+    p <- progressor(steps = n)
+    
+    # iterate over grid:
+    
+    future_map(seq(n), function(i) {
+      
+      p()
+      
+      # fit each model config. to the data...
+      
+      hyperparams <- grid[i, ]
+      
+      wf <- 
+        workflow() |> 
+        add_recipe(recipe) |> 
+        add_model(update(spec, hyperparams)) |> 
+        fit(survey)
+        
+      df_fit <- wf |> augment_ipw(survey)
+      
+      # ...and compute balance:
+      bal <- balance_stats(FORMULA, df_fit, df_fit$ipw)
+      bind_cols(tibble(id = id, config = list(hyperparams)), bal)
+        
+    }, .options = furrr_options(seed = 42)) |> bind_rows()
+    
+  })
+  
+}) |> bind_rows()
+```
+
+## Tuning results
+
+Also fitting a plain logistic regression on the prepped data with all interaction terms, as benchmark (in practice, researchers often resort to using logistic regression to estimate propensity scores, so this is a reasonable benchmark):
+
+```{r}
+plain_log <- 
+  logistic_reg() |> 
+  set_engine("glm") |> 
+  set_mode("classification")
+  
+plain_log_wf <- 
+  workflow() |> 
+  add_recipe(prop_rec_log) |> # `prop_rec_log` adds first-order interactions
+  add_model(plain_log)
+
+plain_log_fit <- 
+  plain_log_wf |> 
+  fit(survey) |> 
+  augment_ipw(survey) |> 
+  (\(df) balance_stats(FORMULA, df, df$ipw))() |> 
+  bind_cols(id = "Logistic Regression")
+```
+
+Best balance achieved by each model, by lowest mean ASMD:
+
+```{r}
+tuning_res |> 
+  group_by(id) |> 
+  arrange(mean_asmd, .by_group = TRUE) |> 
+  slice(1) |> 
+  ungroup() |> 
+  bind_rows(plain_log_fit) |> 
+  arrange(mean_asmd)
+```
+
+Distribution of mean ASMDs by model:
+
+```{r}
+tuning_res |> 
+  ggplot(aes(x = mean_asmd, y = id, color = id, fill = id)) +
+  geom_vline(xintercept = .1, lty = "dotted") +
+  geom_violin(alpha = .25) +
+  labs(fill = "Model", color = "Model", y = "Model", x = "Mean ASMD") +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/mean_asmd_by_model.pdf"), width = 7, height = 5)
+```
+
+Max ASMDs:
+
+```{r}
+tuning_res |> 
+  ggplot(aes(x = max_asmd, y = id, color = id, fill = id)) +
+  geom_vline(xintercept = .1, lty = "dotted") +
+  geom_violin(alpha = .25) +
+  labs(fill = "Model", color = "Model", y = "Model", x = "Max. ASMD") +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/max_asmd_by_model.pdf"), width = 7, height = 5)
+```
+
+ESS vs. mean ASMD:
+
+```{r}
+tuning_res |> 
+  ggplot(aes(x = ess_treat, y = mean_asmd, color = id)) +
+  geom_hline(yintercept = .1, lty = "dotted") +
+  geom_point(alpha = .34) +
+  geom_smooth(se = FALSE, linewidth = .5) +
+  labs(x = "ESS Treated Units", y = "Mean ASMD", color = "Model") +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/ess_vs_mean_asmd.pdf"), width = 7, height = 5)
+```
+
+ESS vs. max ASMD
+
+```{r}
+tuning_res |> 
+  ggplot(aes(x = ess_treat, y = max_asmd, color = id)) +
+  geom_hline(yintercept = .1, lty = "dotted") +
+  geom_point(alpha = .34) +
+  geom_smooth(se = FALSE, linewidth = .5) +
+  labs(x = "ESS Treated Units", y = "Max. ASMD", color = "Model") +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/ess_vs_max_asmd.pdf"), width = 7, height = 5)
+```
+
+Mean vs. Max ASMD (checking for "sacrifice one"-behavior):
+
+```{r}
+tuning_res |> 
+  ggplot(aes(x = max_asmd, y = mean_asmd, color = id)) +
+  geom_vline(xintercept = .1, lty = "dotted") +
+  geom_hline(yintercept = .1, lty = "dotted") +
+  geom_point(alpha = .34) +
+  geom_smooth(se = FALSE, linewidth = .5) +
+  labs(x = "Max. ASMD", y = "Mean ASMD", color = "Model") +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/mean_vs_max_asmd.pdf"), width = 7, height = 5)
+```
+
+# Hyperparams
+
+Exporting hyperparameter plots: for each model, how does each hyperparameter impact mean ASMD?
+
+```{r}
+models |> 
+  pull(id) |> 
+  map(function(model) {
+    
+    name <- tolower(gsub(" ", "_", model))
+    
+    suppressWarnings({
+    
+      p <- 
+        tuning_res |> 
+        filter(id == model) |> 
+        unnest(config) |> 
+        select(id:mean_asmd) |> 
+        pivot_longer(
+          cols = -c(id, mean_asmd), 
+          names_to = "param", 
+          values_to = "value"
+        ) |> 
+        ggplot(aes(x = value, y = mean_asmd)) +
+        geom_point(alpha = .5) +
+        geom_smooth() +
+        facet_wrap(~param, scales = "free_x") +
+        labs(x = "Value", y = "Mean ASMD")
+      
+    })
+    
+    ggsave(
+      here::here(glue::glue("figs/hyperparams_{name}.pdf")),
+      plot = p,
+      width = 7,
+      height = 5
+    )
+    
+    p
+})
+
+# ^ could use `walk()` to save but I wanted to show the plots in the HTML
+```
+
+# Export
+
+Getting the best config for each model:
+
+```{r}
+models_full <- 
+  tuning_res |> 
+  group_by(id) |> 
+  arrange(mean_asmd, .by_group = TRUE) |> 
+  slice(1) |> 
+  ungroup() |> 
+  select(id, config) |> 
+  right_join(models)
+
+models_full |> pull(config) |> set_names(models_full$id)
+```
+
+Fitting the best models to the data & getting estimates, so that for each unit we have an estimated propensity score & IPW from each best model:
+
+```{r}
+estimates <- 
+  models_full |> 
+  mutate(
+    
+    wflow = map2(recipe, spec, function(rec, mod) {
+      workflow() |> 
+        add_recipe(rec) |> 
+        add_model(mod)
+    }),
+    
+    final = map2(wflow, config, \(wf, cfg) finalize_workflow(wf, cfg)),
+    
+    fit = map(final, function(wf) {
+      wf |> 
+        fit(survey) |> 
+        augment_ipw(survey)
+    })
+    
+  ) |> 
+  select(id, fit) |> 
+  unnest(fit) |> 
+  select(id, uuid, ipw, prop, everything())
+
+estimates
+```
+
+Exporting:
+
+```{r}
+estimates |> 
+  select(id, uuid, ipw, prop) |> 
+  readr::write_csv(here::here("data/propensity_scores.csv"))
+```
+
+# Additional diagnostics
+
+Overlap:
+
+```{r}
+estimates |> 
+  mutate(crsv_self_family = factor(crsv_self_family, levels = c(1, 0))) |> 
+  ggplot(aes(x = prop, color = crsv_self_family, fill = crsv_self_family)) +
+  geom_density(alpha = .25) +
+  facet_wrap(~id, ncol = 2) +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "P(S=1|X)",
+    y = "Density",
+    fill = "S",
+    color = "S"
+  ) +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  scale_fill_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/overlap_by_model.pdf"), width = 7, height = 5)
+```
+
+Balance:
+
+```{r}
+balances <- 
+  estimates |> 
+  group_by(id) |> 
+  nest() |> 
+  ungroup() |> 
+  mutate(
+    balance = map(data, function(df) {
+      
+      tab <- bal.tab(
+        FORMULA,
+        weights = df$ipw,
+        data = df,
+        estimand = "ATE",
+        un = TRUE
+      )$Balance
+      
+      tab |> 
+        tibble::rownames_to_column("covariate") |> 
+        rename_with(\(n) tolower(gsub("\\.", "_", n)))
+      
+    })
+  ) |> 
+  select(id, balance) |> 
+  unnest(balance)
+```
+
+Visually:
+
+```{r}
+balances |> 
+  select(-type) |> 
+  pivot_longer(starts_with("diff"), names_to = "adj", values_to = "diff") |> 
+  mutate(
+    adj = adj |> replace_values(
+      "diff_un" ~ "Unadjusted",
+      "diff_adj" ~ "Adjusted"
+    ),
+    adj = factor(adj, levels = c("Unadjusted", "Adjusted")),
+    diff = abs(diff)
+  ) |> 
+  ggplot(
+    aes(
+      x = diff, 
+      y = forcats::fct_reorder(covariate, diff), 
+      color = adj
+    )
+  ) +
+  geom_vline(xintercept = 0) +
+  geom_vline(xintercept = .1, lty = "dotted") +
+  geom_point() +
+  facet_wrap(~id, ncol = 2) +
+  labs(x = "SMD", y = "", color = "") +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  scale_fill_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/final_balance_love_plot.pdf"), width = 7, height = 5)
+```
+
+Effective Sample Size:
+
+```{r}
+estimates |> 
+  group_by(id) |> 
+  nest() |> 
+  ungroup() |> 
+  mutate(
+    balance = map(data, function(df) {
+      
+      obs <- bal.tab(
+        FORMULA,
+        weights = df$ipw,
+        data = df,
+        estimand = "ATE",
+        un = TRUE
+      )$Observations
+      
+      obs |> tibble::rownames_to_column("adj")
+      
+    })
+  ) |> 
+  select(id, balance) |> 
+  unnest(balance) |> 
+  mutate(adj = factor(adj, levels = c("Unadjusted", "Adjusted"))) |> 
+  pivot_longer(c(Control, Treated), names_to = "treat", values_to = "val") |> 
+  ggplot(aes(x = treat, y = val, color = adj, fill = adj)) +
+  geom_col(position = position_dodge(width = .95), alpha = .5) +
+  facet_wrap(~id, ncol = 2) +
+  theme(legend.position = "bottom") +
+  labs(x = "", y = "Effective Sample Size", color = "", fill = "") +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  scale_fill_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/final_balance_ess.pdf"), width = 7, height = 5)
+```

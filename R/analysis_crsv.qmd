@@ -1,0 +1,792 @@
+---
+title: "Wartime sexual violence and intergroup trust"
+format: 
+  html:
+    embed-resources: true
+    message: false
+    warning: false
+    highlight-style: pygments
+editor_options: 
+  chunk_output_type: console
+---
+
+Analyzing causal effect modification in conjoint experiment. 
+
+* Forced-choice conjoint experiments designed to measure interpersonal trust (would you rather give phone to person A or person B)
+* Treatment: person ethnic ingroup vs. ethnic outgroup
+* Effect modifier: wartime sexual violence (self or family member)
+
+So RQ:
+
+> Does direct or indirect exposure to wartime sexual violence affect intergroup trust (= change how ethnic group membership affects trust)?
+
+# Setup
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lmtest)
+library(marginaleffects)
+library(purrr)
+library(sandwich)
+library(survey)
+library(tidyr)
+
+# for plots:
+library(showtext)
+library(sysfonts)
+
+font_add(
+  "Gyre",
+  regular = "/usr/share/texmf/fonts/opentype/public/tex-gyre/texgyretermes-regular.otf"
+)
+
+showtext_auto()
+
+theme_paper <- function(base_size = 14, base_family = "Gyre") {
+  theme_minimal(base_size = base_size, base_family = base_family) +
+    theme(
+      panel.grid.major = element_line(color = "#E5E5E5", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+
+      plot.title = element_text(face = "bold", size = rel(1.2)),
+      plot.subtitle = element_text(color = "black"),
+
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+
+      panel.background = element_blank(),
+      plot.background = element_blank()
+    )
+}
+
+theme_set(theme_paper())
+
+
+set.seed(42)
+```
+
+# Data
+
+```{r}
+survey <- readr::read_csv(here::here("data/survey.csv"))
+conjoint <- readr::read_csv(here::here("data/conjoint.csv"))
+pscores_full <- readr::read_csv(here::here("data/propensity_scores.csv"))
+
+sampling <- haven::read_dta(here::here("data/design_weights_shortID.dta"))
+list_exp <- readr::read_csv(here::here("data/list_experiment.csv"))
+
+# Select which propensity score estimates & weights to use:
+pscores <- pscores_full |> filter(id == "XGBoost") |> select(-id)
+```
+
+# Prep
+
+Joining everything together & merging with conjoint. Operationalizations:
+
+* crsv: self-reported crsv (self or family member)
+* Outgroup: profile belongs to a different ethnic group than respondent
+* Trust: profile selected (e.g. would give phone to that person)
+
+```{r}
+survey <- 
+  survey |> 
+  # older than 12 at start of war:
+  filter(resp_age > 43) |> 
+  fastDummies::dummy_cols(c("resp_ethn", "resp_educ")) |> 
+  left_join(pscores, join_by(uuid)) |>
+  left_join(sampling, join_by(prc_id == shortID))
+
+# Merge into conjoint experiments:
+
+merged <- 
+  conjoint |> 
+  left_join(survey, join_by(uuid)) |> 
+  mutate(
+    across(where(is.character), factor),
+    outgroup = if_else(resp_ethn != ethnicity, 1, 0),
+    # second outgroup measure: wartime enemies
+    # (can play with the specification a little here. Since it's all
+    # random it does not matter; only affects propensities but not
+    # independence as long as common support & positivity hold)
+    outgroup2 = if_else(
+      (resp_ethn %in% c("Bosniak", "Croat") & ethnicity == "Serb") |
+        (resp_ethn == "Serb" & ethnicity %in% c("Bosniak", "Croat")),
+      1L,
+      0L
+    ),
+    ingroup = 1 - outgroup, 
+    ingroup2 = 1 - outgroup2
+  ) |> 
+  drop_na(resp_ethn) |> 
+  fastDummies::dummy_cols(
+    c("ethnicity", "age", "class", "education", "sex", "resp_ethn"),
+    remove_selected_columns = TRUE
+  ) |>
+  select(-c(scenario, round, profile, trust, choice))
+```
+
+# Descriptives
+
+```{r}
+w_wts <- 
+  sampling |> 
+  select(
+    prc_id = shortID, stratum = highrisk, 
+    sampling_weight = w_resp_all_upscaled
+  ) |> 
+  right_join(survey, join_by(prc_id)) |> 
+  drop_na(prc_id)
+```
+
+Survey designs weights etc.:
+
+```{r}
+design <- svydesign(
+  ids = ~prc_id, 
+  weights = ~sampling_weight, 
+  strata = ~stratum,
+  data = w_wts
+)
+
+unadjusted <- svydesign(ids = ~1, weights = ~1, data = survey)
+
+svy_descr <- function(form) {
+  
+  name <- labels(terms(form))
+  
+  stats <- tibble(
+    Name = name,
+    Mean = svymean(form, design, na.rm = TRUE),
+    SD = sqrt(svyvar(form, design, na.rm = TRUE)),
+    Min = min(survey[[name]], na.rm = TRUE),
+    Max = max(survey[[name]], na.rm = TRUE),
+    Count = unwtd.count(form, design)
+  )
+  
+  stats |> mutate(across(-Name, as.numeric))
+}
+```
+
+Descriptives table:
+
+```{r}
+list(
+  ~resp_age, 
+  ~resp_male, 
+  ~resp_ethn_Bosniak, 
+  ~resp_ethn_Croat, 
+  ~resp_ethn_Serb
+) |> 
+  map(function(f) {
+    
+    name <- labels(terms(f))
+    
+    stats <- tibble(
+      Name = name,
+      Mean = svymean(f, unadjusted, na.rm = TRUE), # change to `design` for wts
+      SD = sqrt(svyvar(f, unadjusted, na.rm = TRUE)),
+      Min = min(w_wts[[name]], na.rm = TRUE),
+      Max = max(w_wts[[name]], na.rm = TRUE),
+      Count = unwtd.count(f, unadjusted)
+    )
+  
+    stats |> mutate(across(-Name, as.numeric))
+  }) |> 
+  bind_rows() |> 
+  mutate(
+    across(where(is.numeric), \(x) round(x, 2)),
+    Name = Name |> gsub("resp_(ethn_)?", "", x = _) |> stringr::str_to_title()
+  ) |> 
+  knitr::kable(format = "latex")
+```
+
+## List experiment
+
+crsv (weighted) population estimates:
+
+```{r}
+svyciprop(~crsv_self, design = design, method = "logit")
+svyciprop(~crsv_self_family, design = design, method = "logit")
+```
+
+Sample estimates (to compare to list experiment):
+
+```{r}
+unadj_self <- svyciprop(~crsv_self, design = unadjusted, method = "logit")
+unadj_family <- svyciprop(~crsv_self_family, design = unadjusted, method = "logit")
+
+self_reported <- 
+  list(Self = unadj_self, Family = unadj_family) |> 
+  imap(function(prop, name) {
+    tibble(
+      name = name,
+      lower = as.numeric(attr(prop, "ci")[1]),
+      upper = as.numeric(attr(prop, "ci")[2]),
+      estimate = as.numeric(prop)
+    )
+  }) |> 
+  bind_rows() |> 
+  mutate(across(-name, \(x) x * 100), type = "Self-reported")
+```
+
+Prevalence estimate from list experiment:
+
+```{r}
+list_exp <- 
+  list_exp |> 
+  drop_na(prc_id) |> 
+  mutate(
+    across(
+      contains("count"), 
+      \(x) x*100, 
+      .names = "{gsub('count', 'score', col)}"
+    ),
+    prc_id = factor(prc_id)
+  )
+
+models <- list(
+  Self = fixest::feols(
+    le_self_score ~ treat_control | prc_id,
+    data = list_exp,
+    cluster = ~prc_id
+  ),
+  Family = fixest::feols(
+    le_family_score ~ treat_control | prc_id,
+    data = list_exp,
+    cluster = ~prc_id
+  )
+)
+
+list_exp_res <- 
+  models |> 
+  map(broom::tidy) |> 
+  tibble::enframe() |> 
+  unnest(value) |> 
+  mutate(
+    lower = estimate - std.error, 
+    upper = estimate + std.error,
+    type = "List experiment"
+  ) |> 
+  select(name, estimate, lower, upper, type) |> 
+  bind_rows(self_reported)
+
+list_exp_res
+```
+
+Results visually:
+
+```{r}
+list_exp_res |> 
+  ggplot(aes(x = estimate, y = name, color = type)) +
+  geom_vline(xintercept = 0, lty = "dotted") +
+  geom_point(position = position_dodge(width = .1)) +
+  geom_errorbar(
+    aes(xmin = lower, xmax = upper), 
+    width = .05,
+    position = position_dodge(width = .1)
+  ) +
+  scale_x_continuous(labels = scales::label_percent(scale = 1)) +
+  labs(
+    x = "Prevalence Estimate",
+    y = "",
+    color = ""
+  ) +
+  theme(legend.position = "bottom") +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/list_experiment.pdf"), width = 7, height = 5) 
+```
+
+# Models
+
+Fitting four different models:
+
+1. Naive: Linear regression without controlling for confounding on effect modification.
+2. Controlled regression: linear regression with controlling for confounding on effect modification.
+3. IPW: Pooled IPW estimator.
+4. Propensity score matching: nearest-neighbor propensity score matching.
+
+Fitting the models:
+
+## Naive
+
+```{r}
+naive <- lm(
+  selected ~ ingroup*crsv_self_family, 
+  data = merged
+)
+```
+
+## Controlled
+
+```{r}
+cont <- lm(
+  selected ~ ingroup*(
+    crsv_self_family + 
+    resp_age +
+    resp_ethn_Bosniak +
+    resp_ethn_Serb +
+    resp_ethn_Croat +
+    resp_male +
+    victim_other +
+    resp_educ_Bachelor +
+    #resp_educ_Doctor +
+    resp_educ_Master +
+    resp_educ_None +
+    resp_educ_PostSecondary +
+    resp_educ_Primary +
+    resp_educ_Secondary +
+    resp_educ_Vocational
+  ), 
+  data = merged
+)
+```
+
+## Pooled IPW
+
+```{r}
+weighted <- lm(
+  selected ~ ingroup*(
+    crsv_self_family + 
+      resp_age +
+      resp_ethn_Bosniak +
+      resp_ethn_Serb +
+      resp_ethn_Croat +
+      resp_male +
+      victim_other +
+      resp_educ_Bachelor +
+      #resp_educ_Doctor +
+      resp_educ_Master +
+      resp_educ_None +
+      resp_educ_PostSecondary +
+      resp_educ_Primary +
+      resp_educ_Secondary +
+      resp_educ_Vocational
+  ), 
+  data = merged,
+  weights = ipw
+)
+```
+
+## Propensity score matching
+
+```{r}
+for_mod <- 
+  survey |> 
+  drop_na(crsv_self_family, resp_ethn)
+
+matched <- MatchIt::matchit(
+  crsv_self_family ~ resp_age +
+    resp_ethn_Bosniak + 
+    resp_ethn_Croat + 
+    resp_ethn_Serb +
+    resp_educ_Bachelor +
+    resp_educ_Master +
+    resp_educ_None + 
+    resp_educ_PostSecondary +
+    resp_educ_Primary +
+    resp_educ_Secondary + 
+    resp_educ_Vocational + 
+    resp_male + 
+    victim_other,
+  method = "nearest",
+  distance = for_mod$prop,
+  caliper = .1,
+  caliper.scale = "logit",
+  data = for_mod
+)
+```
+
+Checking match quality:
+
+```{r}
+cobalt::love.plot(matched) +
+  theme_paper() +
+  geom_vline(xintercept = c(-.1, .1), lty = "dotted") +
+  labs(title = "") +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/balance_psm.pdf"), width = 7, height = 5)
+```
+
+Fitting the controlled regression to the matched data. Essentially, using matching as non-parametric preprocessing, as suggested by Ho et al. 2007: we know that there is remaining imbalance, so we know that the difference in means estimator might not be consistent.
+
+```{r}
+matched_df <- MatchIt::match.data(matched)
+
+# have to rejoin this into the conjoint data:
+matched_rejoined <- 
+  conjoint |> 
+  left_join(matched_df, join_by(uuid)) |> 
+  mutate(
+    outgroup = if_else(resp_ethn != ethnicity, 1, 0),
+    # again, second outgroup measure: wartime enemies
+    outgroup2 = if_else(
+      (resp_ethn %in% c("Bosniak", "Croat") & ethnicity == "Serb") |
+        (resp_ethn == "Serb" & ethnicity %in% c("Bosniak", "Croat")),
+      1L,
+      0L
+    ),
+    ingroup = 1 - outgroup,
+    ingroup2 = 1 - outgroup2
+  ) |> 
+  drop_na(resp_ethn) |> 
+  fastDummies::dummy_cols(
+    c("ethnicity", "age", "class", "education", "sex", "resp_ethn"),
+    remove_selected_columns = TRUE
+  ) |> 
+  semi_join(matched_df, join_by(uuid))
+
+matching <- lm(
+  selected ~ ingroup*(
+    crsv_self_family + 
+    resp_age +
+    resp_ethn_Bosniak +
+    resp_ethn_Serb +
+    resp_ethn_Croat +
+    resp_male +
+    victim_other +
+    resp_educ_Bachelor +
+    #resp_educ_Doctor +
+    resp_educ_Master +
+    resp_educ_None +
+    resp_educ_PostSecondary +
+    resp_educ_Primary +
+    resp_educ_Secondary +
+    resp_educ_Vocational
+  ), 
+  data = matched_rejoined
+)
+```
+
+
+# Results
+
+Setup:
+
+```{r}
+mods <- tribble(
+  ~name, ~model,
+  "Naive", naive,
+  "Controlled Reg.", cont,
+  "IPW", weighted,
+  "Matched", matching
+)
+
+regtable <- function(models, ...) {
+  modelsummary::modelsummary(
+    models,
+    stars = c("*" = .1, "**" = .05, "***" = .01),
+    #gof_omit = "Log.Lik|BIC|F$",
+    ...
+  )
+}
+
+avgpreds_crsv <- function(model) {
+  avg_predictions(
+    model,
+    variables = c("ingroup", "crsv_self_family"),
+    vcov = vcovCL(model, cluster = ~uuid, type = "HC1")
+  )
+}
+
+for_vis <- 
+  mods |> 
+  mutate(preds = map(model, avgpreds_crsv)) |> 
+  select(preds, name) |> 
+  unnest(preds) |> 
+  mutate(
+    ingroup = if_else(ingroup == 0, "Outgroup", "Ingroup"),
+    crsv_self_family = factor(
+      if_else(crsv_self_family == 1, "CRSV", "No CRSV"),
+      levels = c("CRSV", "No CRSV")
+    ),
+    across(c(ingroup, crsv_self_family, name), factor),
+    ingroup = forcats::fct_relevel(ingroup, "Outgroup", "Ingroup"),
+    name = name |> factor(
+      levels = c(
+        "Naive",
+        "Controlled Reg.",
+        "IPW",
+        "Matched"
+      )
+    )
+  )
+```
+
+Regression table; we see some attenuation when controlling (effect becomes weaker from Naive -> controlled regression -> pooled IPW), matching outlier but relies on very low number of obs (should either leave calipers alone or just drop PSM altogether?)
+
+```{r}
+list(
+  `Naive` = naive, 
+  `Controlled reg.` = cont, 
+  `IPW` = weighted,
+  `Matched` = matching
+) |> 
+  map(\(m) coeftest(m, .vcov = vcovCL(m, cluster = ~uuid, type = "HC1"))) |> 
+  regtable(
+    coef_map = c(
+      "ingroup" = "Ingroup",
+      "crsv_self_family" = "CRSV",
+      "ingroup:crsv_self_family" = "Ingroup × CRSV"
+    )
+  )
+```
+
+Model estimates visually:
+
+```{r}
+for_vis |> 
+  ggplot(
+    aes(
+      x = estimate, 
+      y = ingroup, 
+      color = crsv_self_family, 
+      shape = name
+    )
+  ) +
+  geom_vline(xintercept = .5, lty = "dotted") +
+  geom_point(position = position_dodge(width = 0.2)) +
+  geom_errorbar(
+    aes(xmin = conf.low, xmax = conf.high),
+    width = 0.1,
+    position = position_dodge(width = 0.2)
+  ) +
+  guides(shape = "none") +
+  labs(
+    x = "P(Selected|Group)",
+    y = "Group",
+    color = "crsv",
+    caption = "Robust SEs, clustered by respondent"
+  ) +
+  facet_wrap(~name, ncol = 2) +
+  theme(
+    panel.border = element_rect(
+      colour = "grey60",
+      fill = NA,
+      linewidth = 0.6
+    ),
+    legend.position = "bottom"
+  ) +
+  scale_color_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/crsv_estimates.pdf"), width = 7, height = 5)
+```
+
+As interaction plots:
+
+```{r}
+for_vis |>  
+  ggplot(
+    aes(
+      x = ingroup, 
+      y = estimate, 
+      color = crsv_self_family, 
+      shape = crsv_self_family
+    )
+  ) +
+  geom_hline(yintercept = .5, lty = "dotted") +
+  geom_ribbon(
+    aes(
+      ymin = conf.low, 
+      ymax = conf.high, 
+      group = crsv_self_family,
+      fill = crsv_self_family
+    ),
+    alpha = .15,
+    color = NA
+  ) +
+  geom_point() +
+  geom_line(aes(group = crsv_self_family)) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    width = 0.02
+  ) +
+  labs(
+    y = "P(Selected|Group)",
+    x = "Group",
+    color = "",
+    fill = "",
+    shape = "",
+    caption = "Robust SEs, clustered by respondent"
+  ) +
+  facet_wrap(~name, ncol = 2) +
+  theme(
+    panel.border = element_rect(
+      colour = "grey60",
+      fill = NA,
+      linewidth = 0.6
+    ),
+    legend.position = "bottom"
+  ) +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  scale_fill_brewer(palette = "Dark2", direction = -1)
+
+ggsave(here::here("figs/crsv_interaction_plots.pdf"), width = 7, height = 5)
+```
+
+Full AMCEs/MMs:
+
+```{r}
+new <- 
+  conjoint |> 
+  left_join(survey, join_by(uuid)) |> 
+  mutate(
+    across(where(is.character), factor),
+    group = if_else(resp_ethn == ethnicity, "Ingroup", "Outgroup"),
+    # baselines festlegen (erstes factor-level wird von `lm` als baseline verwendet;
+    # relevant für AMCEs: erwarteter change in P(selected) bei Wechsel von 
+    # Referenzkategorie/-merkmal zu gg. Kategorie:
+    ethnicity = factor(
+      ethnicity, levels = c("Bosniak", "Croat", "Serb")
+    ),
+    sex = factor(sex, levels = c("Female", "Male")),
+    class = factor(
+      class,
+      levels = c(
+        "Middle",
+        "Lower",
+        "Upper"
+      )
+    ),
+    education = factor(
+      education,
+      levels = c(
+        "Primary school",
+        "None",
+        "University"
+      )
+    ),
+    age = factor(age, levels = c("49", "23", "67")),
+    group = factor(group, levels = c("Ingroup", "Outgroup"))
+  ) |> 
+  drop_na(resp_ethn) 
+
+amce_mod <- lm(selected ~ group + age + class + education + sex, data = new)
+
+amce_clean <- 
+  amce_mod |> 
+  coeftest(vcov. = vcovCL(amce_mod, cluster = ~uuid, type = "HC1")) |> 
+  broom::tidy() |> 
+  mutate(
+    lower = estimate - std.error,
+    upper = estimate + std.error,
+    signif = case_when(
+      p.value < 0.01 ~ "***",
+      p.value < 0.05 ~ "**",
+      p.value < 0.1 ~ "*",
+      TRUE ~ ""
+    )
+  ) |>
+  filter(term != "(Intercept)") |> 
+  # baseline levels wieder mit rein (alles auf null)
+  bind_rows(
+    tribble(
+      ~term, ~estimate, ~lower, ~upper,
+      "groupIngroup", 0, 0, 0,
+      "sexFemale", 0, 0, 0,
+      "classMiddle", 0, 0, 0,
+      "educationPrimary school", 0, 0, 0,
+      "age49", 0, 0, 0
+    )
+  ) |> 
+  mutate(
+    feature = stringr::str_to_title(stringr::str_extract(term, "^[a-zä]+")),
+    attr = gsub("^[a-zä]+", "", term),
+    name = paste0(feature, ": ", attr)
+  )
+
+amce_clean |> 
+  ggplot(aes(x = estimate, y = name, color = feature)) +
+  geom_vline(xintercept = 0, lty = "dotted", linewidth = 1) +
+  geom_point() +
+  geom_text(aes(label = signif), position = position_nudge(y = .2)) +
+  geom_linerange(aes(xmin = lower, xmax = upper)) +
+  theme(legend.position = "none") +
+  labs(
+    title = "Average Marginal Component Effects (AMCEs)",
+    x = "Estimate",
+    y = "",
+    caption = "p < 0.01 = ***, p < 0.05 = **, p < 0.1 = *\nStandard Errors clustered by respondent"
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/amces_full.pdf"), width = 7, height = 5)
+```
+
+Marginal means:
+
+```{r}
+intercept_free_mods <- list(
+  lm(selected ~ 0 + group, data = new),
+  lm(selected ~ 0 + sex, data = new),
+  lm(selected ~ 0 + education, data = new),
+  lm(selected ~ 0 + class, data = new),
+  lm(selected ~ 0 + age, data = new)
+) 
+
+intercept_free_mods |> 
+  map(function(model) {
+    model |> 
+      coeftest(vcov. = vcovCL(model, cluster = ~uuid, type = "HC1")) |> 
+      broom::tidy()
+  }) |> 
+  bind_rows() |> 
+  mutate(
+    lower = estimate - std.error,
+    upper = estimate + std.error,
+    feature = stringr::str_extract(term, "^[a-zä]+"),
+    attr = gsub("^[a-zä]+", "", term),
+    name = paste0(stringr::str_to_title(feature), ": ", attr),
+    lab = as.character(round(estimate, 4))
+  ) |> 
+  select(feature, attr, name, estimate, std.error, lower, upper, lab) |> 
+  ggplot(aes(x = estimate, y = name, color = feature)) +
+  geom_vline(xintercept = .5, lty = "dotted", linewidth = 1) +
+  geom_point() +
+  geom_text(aes(label = lab), position = position_nudge(y = .4), size = 4) +
+  geom_linerange(aes(xmin = lower, xmax = upper)) +
+  theme(legend.position = "none") +
+  labs(
+    title = "Marginal Means",
+    caption = "Intercept-free linear regression, Standard Errors clustered by respondent",
+    x = "Estimate",
+    y = ""
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/marginal_means_full.pdf"), width = 7, height = 5)
+```
+
+Do the two scenarios differ?
+
+```{r}
+restr_scenarios <- 
+  new |> 
+  select(age:sex, group, selected, scenario) |> 
+  lm(selected ~ ., data = _)
+
+unrestr_scenarios <- 
+  new |> 
+  select(age:sex, group, selected, scenario) |> 
+  lm(selected ~ scenario*(.), data = _)
+
+anova(restr_scenarios, unrestr_scenarios, test = "F")
+```
+
+And for ingroup specifically?
+
+```{r}
+anova(
+  lm(selected ~ group, data = new),
+  lm(selected ~ group*scenario, data = new)
+)
+```
+

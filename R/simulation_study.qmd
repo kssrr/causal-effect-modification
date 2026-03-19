@@ -1,0 +1,621 @@
+---
+title: "Simulation Study"
+format: 
+  html:
+    embed-resources: true
+    message: false
+    warning: false
+    highlight-style: pygments
+editor_options: 
+  chunk_output_type: console
+---
+
+Simulation study to empirically make three points:
+
+* When interested in causal interaction, we need to condition not only on $X$, but also on $T \times X$ (second-order estimand)
+* Even with the correct conditioning set, linear models quickly collapse in settings of nonlinearity due to functional form violations
+* Parallel estimation not neccessary for ATME. Idea: $T \perp (Y(1), Y(0), X, S)$ by design, since $T$ is randomized, so balancing within $T$ or across full sample will not make a significant difference since $T$ is randomly distributed anyways.
+
+# Setup
+
+```{r}
+library(cobalt)
+library(dplyr)
+library(furrr)
+library(future)
+library(ggplot2)
+library(progressr)
+library(purrr)
+library(tidymodels)
+library(tidyr)
+
+# for plots:
+library(showtext)
+library(sysfonts)
+
+set.seed(42)
+
+font_add(
+  "Gyre",
+  regular = "/usr/share/texmf/fonts/opentype/public/tex-gyre/texgyretermes-regular.otf"
+)
+
+showtext_auto()
+
+theme_paper <- function(base_size = 14, base_family = "Gyre") {
+  theme_minimal(base_size = base_size, base_family = base_family) +
+    theme(
+      panel.grid.major = element_line(color = "#E5E5E5", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+
+      plot.title = element_text(face = "bold", size = rel(1.2)),
+      plot.subtitle = element_text(color = "black"),
+
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+
+      panel.background = element_blank(),
+      plot.background = element_blank()
+    )
+}
+
+theme_set(theme_paper())
+```
+
+# Data generating process
+
+I simulated a scenario with a binary treatment $T_i \in \{0,1\}$, a binary moderator $S_i$, and one continuous covariate $X_i$. The treatment was randomized independently of all other covariates:
+
+$$
+T_i \sim \text{Bernoulli}(0.5)
+$$
+
+The moderator $S_i$ is not randomized, and is generated as a scenario-specific function $f(\cdot)$ of $X_i$:
+
+$$
+\begin{aligned}
+S_i \mid X_i &\sim \text{Bernoulli}(\text{logit}^{-1}(f(X_i))) \\
+X_i &\sim \mathcal{N}(0, 1)
+\end{aligned}
+$$
+
+Potential outcomes satisfy
+
+$$
+\begin{aligned}
+Y_i(0) &\sim g(X_i) + \varepsilon_i, \ \varepsilon \sim \mathcal{N}(0, 0.5^2), \\
+Y_i(1) &= Y_i(0) + h(X_i) + \theta S \\
+Y_i(1) - Y_i(0) &= h(X_i) + \theta S
+\end{aligned}
+$$
+
+So that the treatment effect is a function of $X$ and $S$. $\theta$ is the strength of the true causal effect modification by $S$. The realized outcome is
+
+$$
+Y_i = T_i Y_i(1) + (1 - T_i) Y_i(0).
+$$
+
+I consider two settings, $\theta = 0$ (no causal effect modification by $S$) and $\theta=0.5$ (causal effect modification by $S$ with confounding by $X$).
+
+First, for each setting, I test a linear scenario
+
+$$
+f(x) = x, \ g(x) = x, \ h(x) = x
+$$
+
+where selection into $S=1$ is caused linearly by $X$, and the treatment effect varies as a linear function of $X$. 
+
+Second, I also test a nonlinear scenario
+
+$$
+f(x) = \begin{cases} 3 + 2 \sin(2x) - 1.5 \text{ if } x > 0 \\ 2\sin(2x) - 1.5 \text{ otherwise.} \end{cases}, \ 
+g(x) = 0.3x - 0.2x^2, \ 
+h(x) = \begin{cases} 0.5 + 0.3\sin(2x) \text{ if } x > 0 \\ 0.3\sin(2x) \text{ otherwise.} \end{cases}
+$$
+
+where selection into $S$ and the treatment effect are affected by $X$ non-linearly. This causes a setting where the treatment is only really effective in a specific region of $X$.
+
+```{r}
+gen_data <- function(n, sel_fun, base_fun, het_fun, gamma = 0) {
+  
+  x <- rnorm(n)
+  t <- rbinom(n, 1, .5)
+  s <- rbinom(n, 1, plogis(sel_fun(x)))
+  
+  
+  mu0 <- base_fun(x)             # baseline outcome
+  tau <- het_fun(x) + gamma * s  # nonlinear effect heterogeneity
+  
+  # potential outcomes:
+  Y0 <- mu0 + rnorm(n, sd = 0.5)
+  Y1 <- Y0 + tau
+  
+  y <- ifelse(t == 1, Y1, Y0)
+  
+  tibble(x, t, s, y)
+  
+}
+
+# couple of non-linear functions probably not well approximable:
+
+f <- function(x) {
+  3 * (x > 0) + 2 * sin(2 * x) - 1.5
+}
+
+g <- function(x) {
+  0.3 * x - 0.2 * x^2 
+}
+
+h <- function(x) {
+  0.5 * (x > 0) + 0.3 * sin(2 * x)
+}
+```
+
+Tuning procedure:
+
+```{r}
+get_weights <- function(d, deg_fr, clip = .025) {
+  
+  suppressWarnings(
+    ps_mod <- glm(
+      s ~ splines::ns(x, df = deg_fr),
+      family = binomial(link = "logit"),
+      data = d
+    )
+  )
+  
+  # propensity scores = predicted s=1 probabilities from X
+  prop <- predict(ps_mod, type = "response")
+  
+  # clip extreme probabilities:
+  prop <- pmin(pmax(prop, clip), 1 - clip)
+  # calculate stabilized weights:
+  pS <- mean(d$s)
+  (d$s * pS / prop) + ((1 - d$s) * (1 - pS) / (1 - prop))
+}
+
+balance_stats <- function(formula, data, weights) {
+  
+  balance <- cobalt::bal.tab(
+    formula,
+    weights = weights,
+    data = data, 
+    estimand = "ATE"
+  )
+  
+  tibble(
+    mean_asmd = mean(abs(balance$Balance$Diff.Adj)),
+    max_asmd = max(abs(balance$Balance$Diff.Adj)),
+    ess_treat = balance$Observations["Adjusted", ]$Treated,
+    ess_cont = balance$Observations["Adjusted", ]$Control
+  )
+}
+
+tune_deg_free <- function(formula, data, range) {
+  
+  map(range, function(df) {
+    
+    bal <- balance_stats(
+      formula,
+      data = data,
+      weights = get_weights(
+        d = data,
+        deg_fr = df
+      )
+    )
+    
+    bal |> bind_cols(df = df)
+    
+  }) |> bind_rows()
+}
+
+pull_best_model <- function(tune_res, metric) {
+  tune_res |> 
+    arrange({{ metric }}) |> 
+    slice(1) |> 
+    pull(df) |> 
+    _[[1]]
+}
+```
+
+# Models
+
+Linear models; one deliberately misspecified (not accounting for $T \times X$):
+
+```{r}
+linear_est <- function(d) {
+  coef(lm(y ~ t*s + t*x, data = d))["t:s"]
+}
+
+linear_est_misspec <- function(d) {
+  coef(lm(y ~ t*s + x, data = d))["t:s"]
+}
+```
+
+Inverse probability weighting, where the propensity score model can account for nonlinearity:
+
+```{r}
+ipw_est <- function(d, clip = 0.025) {
+  
+  best_df <- 
+    tune_deg_free(s ~ x, data = d, range = 1:10) |> 
+    pull_best_model(mean_asmd)
+  
+  ps_mod <- glm(
+    s ~ splines::ns(x, df = best_df),
+    family = binomial(link = "logit"),
+    data = d
+  )
+  
+  # propensity scores = predicted s=1 probabilities from X
+  prop <- predict(ps_mod, type = "response")
+  
+  # clip extreme probabilities:
+  prop <- pmin(pmax(prop, clip), 1 - clip)
+  # calculate stabilized weights:
+  pS <- mean(d$s)
+  ipw <- (d$s * pS / prop) + ((1 - d$s) * (1 - pS) / (1 - prop))
+  
+  coef(lm(y ~ t*s + t*x, data = d, weights = ipw))["t:s"]
+}
+```
+
+The same thing in the "parallel estimation framework" (Bansak 2021):
+
+```{r}
+ipw_par_est <- function(d, clip = 0.025) {
+  d |> 
+    group_by(t) |> 
+    nest() |> 
+    ungroup() |> 
+    mutate(
+      estim = map_dbl(data, function(d) {
+        
+        best_df <- 
+          tune_deg_free(s ~ x, data = d, range = 1:10) |> 
+          pull_best_model(mean_asmd)
+        
+        ps_mod <- glm(
+          s ~ splines::ns(x, df = best_df),
+          family = binomial(link = "logit"),
+          data = d
+        )
+        
+        # propensity scores = predicted s=1 probabilities from X
+        prop <- predict(ps_mod, type = "response")
+        
+        # clip extreme probabilities:
+        prop <- pmin(pmax(prop, clip), 1 - clip)
+        # calculate stabilized weights:
+        pS <- mean(d$s)
+        ipw <- (d$s * pS / prop) + ((1 - d$s) * (1 - pS) / (1 - prop))
+        
+        coef(lm(y ~ s, data = d, weights = ipw))["s"]
+        
+      })
+    ) |> 
+    select(-data) |> 
+    pivot_wider(names_from = t, values_from = estim) |> 
+    mutate(final = `1` - `0`) |> 
+    pull(final)
+}
+```
+
+# Simulation
+
+Laying out the scenarios & procedure; parallelizing over all but one available cores to speed this up:
+
+```{r}
+scenarios <- tribble(
+  ~scenario,   ~sel_fun, ~base_fun, ~het_fun,
+  "Linear",    \(x) x,   \(x) x,    \(x) x,
+  "Nonlinear", f,        g,         h
+)
+
+# Procedure:
+
+monte_carlo <- function(times, n, ...) {
+  
+  plan(multisession, workers = parallel::detectCores() - 1)
+  
+  suppressWarnings({
+    
+    with_progress({
+      
+      p <- progressor(steps = times)
+      
+      future_map(1:times, function(i) {
+        
+        p()
+        
+        df <- gen_data(n, ...)
+        
+        tribble(
+          ~model,             ~est,                   ~run,
+          "Linear",           linear_est(df),         i,
+          "Linear, misspec.", linear_est_misspec(df), i,
+          "IPW",              ipw_est(df),            i,
+          "IPW, Parallel",    ipw_par_est(df),        i
+        )
+        
+      }, .options = furrr_options(seed = 42))
+      
+    })
+    
+  })
+  
+}
+```
+
+# First setting: no true causal moderation by $S$
+
+```{r}
+sim_res <- pmap(scenarios, function(scenario, sel_fun, base_fun, het_fun) {
+  
+  message(paste0("Working on ", scenario))
+  
+  res <- monte_carlo(
+    times = 500, # originally: 1000
+    n = 2500,
+    sel_fun = sel_fun,
+    base_fun = base_fun, 
+    het_fun = het_fun
+  )
+  
+  res |> bind_rows() |> mutate(scenario = scenario)
+  
+}) |> bind_rows()
+```
+
+## Results
+
+```{r}
+sim_res |>  
+  group_by(model, scenario) |> 
+  summarise(
+    mean = mean(est),
+    lower = quantile(est, .025),
+    upper = quantile(est, .975)
+  ) |> 
+  ungroup() |> 
+  arrange(scenario, model) |> 
+  select(
+    scenario, model, estimate = mean,`2.5%` = lower, `97.5%` = upper
+  ) |> 
+  rename_with(stringr::str_to_title) |> 
+  knitr::kable(format = "latex")
+```
+
+Visually:
+
+```{r}
+sim_res |> 
+  mutate(scenario = factor(scenario, levels = c("Nonlinear", "Linear"))) |> 
+  group_by(model, scenario) |> 
+  summarise(
+    mean = mean(est),
+    lower = quantile(est, .025),
+    upper = quantile(est, .975)
+  ) |> 
+  ggplot(aes(x = mean, y = scenario, color = model)) +
+  geom_vline(xintercept = 0, lty = "dotted") +
+  geom_point(position = position_dodge(width = .15)) +
+  geom_linerange(
+    aes(xmin = lower, xmax = upper), 
+    position = position_dodge(width = .15)
+  ) +
+  labs(
+    x = "Estimate",
+    y = "Scenario",
+    color = "Model"
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_res.pdf"), width = 7, height = 5)
+```
+
+Distributions:
+
+```{r}
+sim_res |> 
+  group_by(model, scenario) |> 
+  ggplot(aes(x = est, color = model, fill = model)) +
+  geom_vline(xintercept = 0, lty = "dotted") +
+  geom_density(alpha = .25) +
+  facet_wrap(~scenario, ncol = 1) +
+  labs(
+    x = "Estimate", 
+    y = "Density",
+    color = "Model",
+    fill = "Model"
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_res_dist.pdf"), width = 7, height = 5)
+```
+
+# Second setting: true (confounded) causal effect moderation by $S$
+
+Here, $S$ is actually an effect modifier:
+
+```{r}
+scenarios2 <- tribble(
+  ~scenario,   ~sel_fun, ~base_fun, ~het_fun, ~gamma,
+  "Linear",    \(x) x,   \(x) x,    \(x) x,   .5,
+  "Nonlinear", f,        g,         h,        .5
+)
+```
+
+Running again:
+
+```{r}
+sim_res2 <- pmap(scenarios2, function(scenario, sel_fun, base_fun, het_fun, gamma) {
+  
+  message(paste0("Working on ", scenario))
+  
+  res <- monte_carlo(
+    times = 1000,
+    n = 2500,
+    sel_fun = sel_fun,
+    base_fun = base_fun, 
+    het_fun = het_fun,
+    gamma = gamma
+  )
+  
+  res |> bind_rows() |> mutate(scenario = scenario)
+  
+}) |> bind_rows()
+```
+
+## Results
+
+```{r}
+sim_res2 |>  
+  group_by(model, scenario) |> 
+  summarise(
+    mean = mean(est),
+    lower = quantile(est, .025),
+    upper = quantile(est, .975)
+  ) |> 
+  ungroup() |> 
+  arrange(scenario, model) |> 
+  select(
+    scenario, model, estimate = mean,`2.5%` = lower, `97.5%` = upper
+  ) |> 
+  rename_with(stringr::str_to_title) |> 
+  knitr::kable(format = "latex")
+```
+
+```{r}
+sim_res2 |> 
+  mutate(scenario = factor(scenario, levels = c("Nonlinear", "Linear"))) |> 
+  group_by(model, scenario) |> 
+  summarise(
+    mean = mean(est),
+    lower = quantile(est, .025),
+    upper = quantile(est, .975)
+  ) |> 
+  ggplot(aes(x = mean, y = scenario, color = model)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_vline(xintercept = 0.5, lty = "dotted") +
+  geom_point(position = position_dodge(width = .15)) +
+  geom_linerange(
+    aes(xmin = lower, xmax = upper), 
+    position = position_dodge(width = .15)
+  ) +
+  labs(
+    x = "Estimate",
+    y = "Scenario",
+    color = "Model"
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_res2.pdf"), width = 7, height = 5)
+```
+
+Distributions:
+
+```{r}
+sim_res2 |> 
+  group_by(model, scenario) |> 
+  ggplot(aes(x = est, color = model, fill = model)) +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_vline(xintercept = .5, lty = "dotted") +
+  geom_density(alpha = .25) +
+  facet_wrap(~scenario, ncol = 1) +
+  labs(
+    x = "Estimate", 
+    y = "Density",
+    color = "Model",
+    fill = "Model"
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_res2_dist.pdf"), width = 7, height = 5)
+```
+
+# Additional stuff
+
+## Visualizations of the scenarios:
+
+### Linear
+
+```{r}
+tibble(x = seq(-3, 3, length.out = 500)) |> 
+  mutate(y = plogis(x)) |> 
+  ggplot(aes(x = x, y = y)) +
+  geom_line() +
+  labs(x = "X", y = "Pr(S=1)")
+
+ggsave(here::here("figs/sim_funs_f_linear.pdf"), width = 7, height = 5)
+```
+
+```{r}
+tibble(x = seq(-3, 3, length.out = 500)) |>
+  mutate(
+    Y0 = x,
+    Y1 = x + x
+  ) |>
+  pivot_longer(c(Y0, Y1), names_to = "treatment", values_to = "Ey") |>
+  mutate(
+    treatment = treatment |> replace_values(
+      "Y0" ~ "Control (T=0)",
+      "Y1" ~ "Treated (T=1)"
+    )
+  ) |>
+  ggplot(aes(x = x, y = Ey, color = treatment)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "X",
+    y = "Expected outcome",
+    color = ""
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_funs_Ey_linear.pdf"), width = 7, height = 5)
+```
+
+### Nonlinear:
+
+```{r}
+tibble(x = seq(-3, 3, length.out = 500)) |> 
+  mutate(y = plogis(f(x))) |> 
+  ggplot(aes(x = x, y = y)) +
+  geom_line() +
+  labs(x = "X", y = "Pr(S=1)")
+
+ggsave(here::here("figs/sim_funs_f.pdf"), width = 7, height = 5)
+```
+
+```{r}
+tibble(x = seq(-3, 3, length.out = 500)) |>
+  mutate(
+    Y0 = g(x),
+    Y1 = g(x) + h(x)
+  ) |>
+  pivot_longer(c(Y0, Y1), names_to = "treatment", values_to = "Ey") |>
+  mutate(
+    treatment = treatment |> replace_values(
+      "Y0" ~ "Control (T=0)",
+      "Y1" ~ "Treated (T=1)"
+    )
+  ) |>
+  ggplot(aes(x = x, y = Ey, color = treatment)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "X",
+    y = "Expected outcome",
+    color = ""
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(here::here("figs/sim_funs_Ey.pdf"), width = 7, height = 5)
+```
