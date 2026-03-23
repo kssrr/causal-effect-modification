@@ -374,7 +374,7 @@ tuning_res |>
   scale_color_brewer(palette = "Dark2") +
   scale_fill_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/mean_asmd_by_model.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/mean_asmd_by_model.pdf"), width = 7, height = 5)
 ```
 
 Max ASMDs:
@@ -388,7 +388,7 @@ tuning_res |>
   scale_color_brewer(palette = "Dark2") +
   scale_fill_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/max_asmd_by_model.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/max_asmd_by_model.pdf"), width = 7, height = 5)
 ```
 
 ESS vs. mean ASMD:
@@ -402,7 +402,7 @@ tuning_res |>
   labs(x = "ESS Treated Units", y = "Mean ASMD", color = "Model") +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/ess_vs_mean_asmd.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/ess_vs_mean_asmd.pdf"), width = 7, height = 5)
 ```
 
 ESS vs. max ASMD
@@ -416,7 +416,7 @@ tuning_res |>
   labs(x = "ESS Treated Units", y = "Max. ASMD", color = "Model") +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/ess_vs_max_asmd.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/ess_vs_max_asmd.pdf"), width = 7, height = 5)
 ```
 
 Mean vs. Max ASMD (checking for "sacrifice one"-behavior):
@@ -431,7 +431,7 @@ tuning_res |>
   labs(x = "Max. ASMD", y = "Mean ASMD", color = "Model") +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/mean_vs_max_asmd.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/mean_vs_max_asmd.pdf"), width = 7, height = 5)
 ```
 
 # Hyperparams
@@ -465,12 +465,12 @@ models |>
       
     })
     
-    ggsave(
-      here::here(glue::glue("figs/hyperparams_{name}.pdf")),
-      plot = p,
-      width = 7,
-      height = 5
-    )
+    #ggsave(
+    #  here::here(glue::glue("figs/hyperparams_{name}.pdf")),
+    #  plot = p,
+    #  width = 7,
+    #  height = 5
+    #)
     
     p
 })
@@ -552,7 +552,7 @@ estimates |>
   scale_color_brewer(palette = "Dark2", direction = -1) +
   scale_fill_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/overlap_by_model.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/overlap_by_model.pdf"), width = 7, height = 5)
 ```
 
 Balance:
@@ -614,7 +614,7 @@ balances |>
   scale_color_brewer(palette = "Dark2", direction = -1) +
   scale_fill_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/final_balance_love_plot.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/final_balance_love_plot.pdf"), width = 7, height = 5)
 ```
 
 Effective Sample Size:
@@ -651,5 +651,5 @@ estimates |>
   scale_color_brewer(palette = "Dark2", direction = -1) +
   scale_fill_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/final_balance_ess.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/final_balance_ess.pdf"), width = 7, height = 5)
 ```
