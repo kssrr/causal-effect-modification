@@ -84,8 +84,8 @@ list(~resp_age, ~resp_male, ~resp_ethn_Bosniak, ~resp_ethn_Croat, ~resp_ethn_Ser
 Population estimates:
 
 ```{r}
-svyciprop(~wtsv_self, design = design, method = "logit")
-svyciprop(~wtsv_self_family, design = design, method = "logit")
+svyciprop(~crsv_self, design = design, method = "logit")
+svyciprop(~crsv_self_family, design = design, method = "logit")
 ```
 
 Sample estimates:
@@ -94,8 +94,8 @@ Sample estimates:
 
 unadjusted <- svydesign(ids = ~1, weights = ~1, data = survey)
 
-unadj_self <- svyciprop(~wtsv_self, design = unadjusted, method = "logit")
-unadj_family <- svyciprop(~wtsv_self_family, design = unadjusted, method = "logit")
+unadj_self <- svyciprop(~crsv_self, design = unadjusted, method = "logit")
+unadj_family <- svyciprop(~crsv_self_family, design = unadjusted, method = "logit")
 
 unadj_self
 unadj_family
