@@ -417,7 +417,7 @@ sim_res |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_res.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_res.pdf"), width = 7, height = 5)
 ```
 
 Distributions:
@@ -438,7 +438,7 @@ sim_res |>
   scale_color_brewer(palette = "Dark2") +
   scale_fill_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_res_dist.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_res_dist.pdf"), width = 7, height = 5)
 ```
 
 # Second setting: true (confounded) causal effect moderation by $S$
@@ -517,7 +517,7 @@ sim_res2 |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_res2.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_res2.pdf"), width = 7, height = 5)
 ```
 
 Distributions:
@@ -539,7 +539,7 @@ sim_res2 |>
   scale_color_brewer(palette = "Dark2") +
   scale_fill_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_res2_dist.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_res2_dist.pdf"), width = 7, height = 5)
 ```
 
 # Additional stuff
@@ -555,7 +555,7 @@ tibble(x = seq(-3, 3, length.out = 500)) |>
   geom_line() +
   labs(x = "X", y = "Pr(S=1)")
 
-ggsave(here::here("figs/sim_funs_f_linear.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_funs_f_linear.pdf"), width = 7, height = 5)
 ```
 
 ```{r}
@@ -580,7 +580,7 @@ tibble(x = seq(-3, 3, length.out = 500)) |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_funs_Ey_linear.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_funs_Ey_linear.pdf"), width = 7, height = 5)
 ```
 
 ### Nonlinear:
@@ -592,7 +592,7 @@ tibble(x = seq(-3, 3, length.out = 500)) |>
   geom_line() +
   labs(x = "X", y = "Pr(S=1)")
 
-ggsave(here::here("figs/sim_funs_f.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_funs_f.pdf"), width = 7, height = 5)
 ```
 
 ```{r}
@@ -617,5 +617,5 @@ tibble(x = seq(-3, 3, length.out = 500)) |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/sim_funs_Ey.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/sim_funs_Ey.pdf"), width = 7, height = 5)
 ```

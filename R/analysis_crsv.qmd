@@ -301,7 +301,7 @@ list_exp_res |>
   theme(legend.position = "bottom") +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/list_experiment.pdf"), width = 7, height = 5) 
+#ggsave(here::here("figs/list_experiment.pdf"), width = 7, height = 5) 
 ```
 
 # Models
@@ -413,7 +413,7 @@ cobalt::love.plot(matched) +
   labs(title = "") +
   scale_color_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/balance_psm.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/balance_psm.pdf"), width = 7, height = 5)
 ```
 
 Fitting the controlled regression to the matched data. Essentially, using matching as non-parametric preprocessing, as suggested by Ho et al. 2007: we know that there is remaining imbalance, so we know that the difference in means estimator might not be consistent.
@@ -577,7 +577,7 @@ for_vis |>
   ) +
   scale_color_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/crsv_estimates.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/crsv_estimates.pdf"), width = 7, height = 5)
 ```
 
 As interaction plots:
@@ -629,7 +629,7 @@ for_vis |>
   scale_color_brewer(palette = "Dark2", direction = -1) +
   scale_fill_brewer(palette = "Dark2", direction = -1)
 
-ggsave(here::here("figs/crsv_interaction_plots.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/crsv_interaction_plots.pdf"), width = 7, height = 5)
 ```
 
 Full AMCEs/MMs:
@@ -718,7 +718,7 @@ amce_clean |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/amces_full.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/amces_full.pdf"), width = 7, height = 5)
 ```
 
 Marginal means:
@@ -762,7 +762,7 @@ intercept_free_mods |>
   ) +
   scale_color_brewer(palette = "Dark2")
 
-ggsave(here::here("figs/marginal_means_full.pdf"), width = 7, height = 5)
+#ggsave(here::here("figs/marginal_means_full.pdf"), width = 7, height = 5)
 ```
 
 Do the two scenarios differ?
